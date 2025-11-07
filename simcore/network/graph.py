@@ -91,7 +91,7 @@ class NetworkGraph:
         node_names = [n for n in self.nodes if not self.nodes[n].is_ground]
         branch_names = list(self.branches.keys())
         A = np.zeros((len(node_names), len(branch_names)), dtype=float)
-        for j, b in enumerate(branch_names):
+        for j, b in enumerate(branch_names): # cycle through branches
             src, dst = self.branches[b]
             if not self.nodes[src].is_ground:
                 A[node_names.index(src), j] += 1.0
