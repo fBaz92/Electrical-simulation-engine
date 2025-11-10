@@ -188,19 +188,42 @@ class Network:
                     r = comp.state_residual(ctx, zc_next, zc_prev)
                     R_states.append(r)
                     J_zz_blocks.append(comp.dRdz(ctx, zc_next))
-                    dv = comp.dRdv(ctx, zc_next)     # shape (1,)
-                    a_col = A[:, bi].reshape(-1,1)   # (n_nodes,1)
-                    J_zv_rows.append(dv.reshape(1,1) @ a_col.T)
+                    dv = comp.dRdv(ctx, zc_next)      # shape (n_states,)
+                    a_col = A[:, bi].reshape(1, -1)   # shape (1, n_nodes)
+
+                    # dv (n_states,) → (n_states,1)
+                    dv_col = dv.reshape(-1, 1)        # (n_states, 1)
+
+                    # (n_states,1) @ (1,n_nodes) → (n_states, n_nodes)
+                    J_zv_rows.append(dv_col @ a_col)
                     s_idx += 1
             F_st = np.concatenate(R_states) if R_states else np.empty(0)
             J_zv = np.vstack(J_zv_rows) if J_zv_rows else np.zeros((0, A.shape[0]))
             # dF_nodes/dz
+            
+            # --- costruzione J_vz (dF_nodes/dz) generica per più stati per componente ---
             J_vz_cols = []
-            for s_idx, bi in enumerate(self.stateful_indices):
-                vec = np.zeros(len(comps))
-                vec[bi] = dI_dz_cols[s_idx][0]
-                J_vz_cols.append((A @ vec).reshape(-1,1))
+            s_cursor = 0
+            for bi, comp in enumerate(comps):
+                if comp.n_states() > 0:
+                    zc_next = z_split[s_cursor]
+                    # ricostruisci il contesto per questo ramo
+                    ctx = EvalContext(
+                        v_branch=float(v_branch[bi]),
+                        dvdt_branch=float(dvdt_branch[bi]),
+                        t_next=float(t_next),
+                        dt=float(dt)
+                    )
+                    dIdz = comp.dI_dz(ctx, zc_next).ravel()   # shape (m_states_comp,)
+                    for d in dIdz:
+                        vec = np.zeros(len(comps))
+                        vec[bi] = d
+                        J_vz_cols.append((A @ vec).reshape(-1,1))
+                    s_cursor += 1
+            # se nessun componente ha stati, J_vz è (n_nodes x 0)
             J_vz = np.hstack(J_vz_cols) if J_vz_cols else np.zeros((A.shape[0], 0))
+
+            
             J_zz = np.block([[blk for blk in J_zz_blocks]]) if J_zz_blocks else np.zeros((0,0))
         else:
             F_st = np.empty(0)
