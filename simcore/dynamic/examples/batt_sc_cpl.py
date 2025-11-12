@@ -2,18 +2,19 @@ import sys
 from pathlib import Path
 
 # Add project root to Python path to enable simcore imports
-project_root = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(project_root))
+project_root = Path(__file__).resolve().parents[3]
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 
 import numpy as np
-from simcore.components.resistor import Resistor
-from simcore.components.capacitor import Capacitor
-from simcore.components.battery_lut import LithiumBatteryLUT
-from simcore.components.constant_power_load import ConstantPowerLoad
-from simcore.components.base import EvalContext, BranchComponent
-from simcore.network.graph import Node, NetworkGraph
-from simcore.network.network import Network
-from simcore.solver.integrate import run_sim
+from simcore.dynamic.components.resistor import Resistor
+from simcore.dynamic.components.capacitor import Capacitor
+from simcore.dynamic.components.battery_lut import LithiumBatteryLUT
+from simcore.dynamic.components.constant_power_load import ConstantPowerLoad
+from simcore.dynamic.components.base import EvalContext, BranchComponent
+from simcore.dynamic.network.graph import Node, NetworkGraph
+from simcore.dynamic.network.network import Network
+from simcore.dynamic.solver.integrate import run_sim
 
 # ---- Profilo di potenza: 50W + impulso 300W ogni 5s per 0.5s ----
 def P_profile(t):

@@ -3,15 +3,15 @@ from pathlib import Path
 import numpy as np
 
 # ensure project root on path when running as standalone script
-project_root = Path(__file__).resolve().parent.parent.parent
+project_root = Path(__file__).resolve().parents[3]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from simcore.components.motor_dc import MotorDCComponent
-from simcore.components.controlled_voltage_source import ControlledVoltageSource
-from simcore.network.graph import Node, NetworkGraph
-from simcore.network.network import Network
-from simcore.solver.integrate import run_sim
+from simcore.dynamic.components.motor_dc import MotorDCComponent
+from simcore.dynamic.components.controlled_voltage_source import ControlledVoltageSource
+from simcore.dynamic.network.graph import Node, NetworkGraph
+from simcore.dynamic.network.network import Network
+from simcore.dynamic.solver.integrate import run_sim
 
 
 def main() -> None:
