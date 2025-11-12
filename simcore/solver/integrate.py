@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import numpy as np
 from typing import Dict, Callable
 from ..network.network import Network
-from ..components.base import BranchComponent
+from ..components.base import BranchComponent, TimeTrace
 from .newton import newton_solve, NewtonConfig
 
 Array = np.ndarray
@@ -23,28 +23,69 @@ class SimResult:
         z_hist: Component state history, shape (N+1, n_states_total).
             Each row corresponds to a time step, columns are concatenated states
             from all stateful components.
+        state_slices: Mapping from branch name to the slice selecting its states.
+        state_names: Mapping from branch name to the list of state labels.
+        v_branches: Branch voltage history, shape (N+1, n_branches) following network.branch_names.
+        branch_index: Mapping branch name -> column index inside v_branches.
     """
     t: Array
     v_nodes: Array     # shape (n_nodes, N+1)
     z_hist: Array      # shape (N+1, n_states_total)
+    state_slices: Dict[str, slice]
+    state_names: Dict[str, list[str]]
+    v_branches: Array
+    branch_index: Dict[str, int]
 
-    def get_state(self, name: str, net: Network) -> Array:
+    def component_state(self, branch_name: str, state_name: str | None = None
+                        ) -> tuple[Array, Array]:
         """
-        Extract state history for a specific component by name.
-        
-        Utility method to retrieve the time history of internal states for a
-        named component. Currently returns a placeholder (first state column).
-        Should be extended with a proper name-to-slice mapping.
-        
-        Args:
-            name: Name of the component/branch.
-            net: Network instance to access component information.
-        
-        Returns:
-            Array of state values over time (placeholder implementation).
+        Return the time history of the states associated with a branch.
         """
-        # utility da estendere con mappa nomi->slice
-        return self.z_hist[:, 0]  # esempio per batteria singola
+        sl = self.state_slices.get(branch_name)
+        if sl is None:
+            raise KeyError(f"Component '{branch_name}' has no recorded states.")
+        block = self.z_hist[:, sl]
+        if state_name is None:
+            return self.t, block
+        names = self.state_names.get(branch_name, [])
+        if not names:
+            raise KeyError(f"State names unavailable for component '{branch_name}'.")
+        try:
+            idx = names.index(state_name)
+        except ValueError as exc:
+            raise KeyError(
+                f"State '{state_name}' not found in component '{branch_name}'."
+            ) from exc
+        return self.t, block[:, idx]
+
+    def branch_voltage(self, branch_name: str) -> tuple[Array, Array]:
+        """
+        Return the branch voltage time series for the specified component.
+        """
+        idx = self.branch_index.get(branch_name)
+        if idx is None:
+            raise KeyError(f"Branch '{branch_name}' not present in this simulation.")
+        return self.t, self.v_branches[:, idx]
+
+    def attach_component_traces(self, components: Dict[str, BranchComponent]) -> None:
+        """
+        Bind recorded histories directly to component instances.
+        """
+        for name, comp in components.items():
+            sl = self.state_slices.get(name)
+            if sl is None:
+                comp._attach_state_trace(None)
+            else:
+                names = self.state_names.get(name, [])
+                trace = TimeTrace(t=self.t, values=self.z_hist[:, sl], names=names)
+                comp._attach_state_trace(trace)
+
+            idx = self.branch_index.get(name)
+            if idx is None:
+                comp._attach_voltage_trace(None)
+            else:
+                v_trace = TimeTrace(t=self.t, values=self.v_branches[:, idx])
+                comp._attach_voltage_trace(v_trace)
 
 def run_sim(network: Network, t_stop: float, v0_nodes: Array | None = None,
             newton_cfg: NewtonConfig | None = None) -> SimResult:
@@ -108,7 +149,20 @@ def run_sim(network: Network, t_stop: float, v0_nodes: Array | None = None,
         z_prev = x_sol[nv:]              # aggiorna stato
         z_hist[k+1, :] = z_prev          # <-- salva lo stato al passo k+1
 
-    return SimResult(t=t, v_nodes=v_nodes, z_hist=z_hist)
+    v_branches = (network.A.T @ v_nodes).T  # shape (N+1, n_branches)
+    branch_index = {name: idx for idx, name in enumerate(network.branch_names)}
+
+    result = SimResult(
+        t=t,
+        v_nodes=v_nodes,
+        z_hist=z_hist,
+        state_slices=network.state_slice_map,
+        state_names=network.state_name_map,
+        v_branches=v_branches,
+        branch_index=branch_index,
+    )
+    result.attach_component_traces(network.components)
+    return result
 
 
 def run_sim_with_control(
@@ -201,4 +255,17 @@ def run_sim_with_control(
         z_prev = z_next.copy()
         z_hist[k+1, :] = z_prev
 
-    return SimResult(t=t, v_nodes=v_nodes, z_hist=z_hist)
+    v_branches = (network.A.T @ v_nodes).T
+    branch_index = {name: idx for idx, name in enumerate(network.branch_names)}
+
+    result = SimResult(
+        t=t,
+        v_nodes=v_nodes,
+        z_hist=z_hist,
+        state_slices=network.state_slice_map,
+        state_names=network.state_name_map,
+        v_branches=v_branches,
+        branch_index=branch_index,
+    )
+    result.attach_component_traces(network.components)
+    return result

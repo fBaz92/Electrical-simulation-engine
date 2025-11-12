@@ -14,7 +14,10 @@ Motore per la simulazione nel dominio del tempo di reti elettriche con component
   ```
 - **Eseguire un esempio**  
   ```bash
-  python3 simcore/examples/batt_sc_cpl.py
+  python3 simcore/examples/batt_sc_cpl.py            # battery + supercap + CPL
+  python3 simcore/examples/motor_dc_states.py        # DC motor with direct state traces
+  python3 simcore/examples/series_rc_step.py         # Series RC composite branch
+  python3 simcore/examples/thermal_resistor_heating.py # Self-heating resistor with thermal RC
   ```
   Produce la risposta nel tempo di una batteria con resistenza serie, un condensatore e un carico a potenza costante.
 - **Notebook interattivo**  
@@ -93,6 +96,13 @@ con fattori di regolarizzazione diagonali e ricerca in linea di tipo Armijo per 
 - Jacobiana: \( \frac{\partial i}{\partial v} = \frac{1}{R} \).
 - Componente puramente statico (nessuno stato interno).
 
+### Thermal Resistor (`simcore/components/resistor_thermal.py`)
+
+- Resistenza dipendente dalla temperatura: \( R(T) = R_0 \left[1 + \alpha (T - T_\text{ref})\right] \).
+- Corrente: \( i = \frac{v}{R(T)} \) con derivata \( \partial i / \partial v = 1/R(T) \) e \( \partial i / \partial T = -v\,\alpha R_0 / R(T)^2 \).
+- Stato termico: \( C_\text{th} \, \frac{dT}{dt} = \frac{v^2}{R(T)} - \frac{T - T_\text{amb}}{R_\text{th}} \).
+- Il residuo viene integrato implicitamente e lo stato è osservabile via `component.state_history("T")`; la resistenza elettrica si aggiorna automaticamente passo dopo passo.
+
 ### Capacitor (`simcore/components/capacitor.py`)
 
 - Relazione continuo-temporale: \( i = C \frac{dv}{dt} \).
@@ -166,10 +176,11 @@ Risultato finale: `SimResult` con vettori `t`, `v_nodes` (matrice \( n_\text{nod
 - **Nuovi componenti**: eredita da `BranchComponent`, implementa `current`, `dI_dv`, opzionalmente stati (`n_states`, `state_init`, `state_residual`, `dRdz`, `dRdv`, `dI_dz`).
 - **Opzioni solver**: modifica `NewtonConfig` per cambiare tolleranza, iterazioni massime o disattivare il damping.
 - **Analisi avanzate**: usa i dati di `SimResult` per post-processing in NumPy/Pandas o per grafici (`matplotlib`).
+- **Componenti compositi**: se vuoi riutilizzare macro a due morsetti (es. filtri RC), eredita da `CompositeBranchComponent`. Registra i nodi interni con `add_internal_node` e i rami primitivi con `add_branch`, usando `+` e `-` per i terminali esterni. `Network` espande automaticamente questi blocchi in rami elementari; l'utente finale li istanzia e li aggiunge al grafo come qualunque altro componente. Il file `simcore/components/composites.py` contiene l'esempio `SeriesRC` (resistenza in serie a un condensatore).
+- **Accesso alle grandezze**: dopo una simulazione puoi interrogare direttamente i componenti (`comp.state_history("SOC")`, `comp.voltage_history()`) oppure usare `SimResult.component_state(...)` / `SimResult.branch_voltage(...)` per recuperare le time-series senza passare dagli oggetti originali.
 
 ---
 
 ## Requisiti
 
 Le dipendenze principali sono in `requirements.txt` (NumPy, Matplotlib, Jupyter e pacchetti correlati). L'uso di un ambiente virtuale dedicato è raccomandato per mantenere coerenti i pacchetti.
-

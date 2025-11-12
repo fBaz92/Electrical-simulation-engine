@@ -2,8 +2,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 import numpy as np
-from ..components.base import BranchComponent, EvalContext
-from .graph import NetworkGraph
+from ..components.base import BranchComponent, EvalContext, CompositeBranchComponent
+from .graph import NetworkGraph, Node
 
 Array = np.ndarray
 
@@ -39,6 +39,8 @@ class Network:
     stateful_indices: List[int] = field(init=False)
     z0: Array = field(init=False)
     _slices: List[slice] = field(init=False)
+    state_slice_map: Dict[str, slice] = field(init=False, repr=False)
+    state_name_map: Dict[str, list[str]] = field(init=False, repr=False)
 
     def _apply_capacitor_initial_conditions(self, v_nodes: np.ndarray):
         """
@@ -71,6 +73,7 @@ class Network:
         the initial state vector. Also creates slice objects to efficiently extract
         individual component states from the concatenated state vector.
         """
+        self._flatten_composites()
         A, node_names, branch_names = self.graph.incidence_matrix()
         object.__setattr__(self, "A", A)
         object.__setattr__(self, "node_names", node_names)
@@ -81,21 +84,33 @@ class Network:
         # stati
         stateful_indices: List[int] = []
         z_init = []
+        state_slice_map: Dict[str, slice] = {}
+        state_name_map: Dict[str, list[str]] = {}
+        off = 0
+        _slices: List[slice] = []
         for i, c in enumerate(comps_ordered):
             if c.n_states() > 0:
                 stateful_indices.append(i)
                 z_init.append(c.state_init())
+                sl = slice(off, off + c.n_states())
+                _slices.append(sl)
+                state_slice_map[branch_names[i]] = sl
+                names = c.state_names()
+                if names and len(names) != c.n_states():
+                    raise ValueError(
+                        f"Component '{branch_names[i]}' declares {c.n_states()} states "
+                        f"but state_names() returned {len(names)} entries."
+                    )
+                if not names:
+                    names = [f"{branch_names[i]}[{k}]" for k in range(c.n_states())]
+                state_name_map[branch_names[i]] = names
+                off += c.n_states()
         object.__setattr__(self, "stateful_indices", stateful_indices)
         object.__setattr__(self, "z0", np.concatenate(z_init) if z_init else np.empty(0))
 
-        # slice per ciascun componente con stato
-        _slices: List[slice] = []
-        off = 0
-        for i in stateful_indices:
-            n = comps_ordered[i].n_states()
-            _slices.append(slice(off, off+n))
-            off += n
         object.__setattr__(self, "_slices", _slices)
+        object.__setattr__(self, "state_slice_map", state_slice_map)
+        object.__setattr__(self, "state_name_map", state_name_map)
 
     # helper
     def _split_z(self, z: Array) -> List[Array]:
@@ -112,6 +127,54 @@ class Network:
             List of state arrays, one per stateful component (in order of stateful_indices).
         """
         return [z[sl] for sl in self._slices]
+
+    def state_slice(self, branch_name: str) -> slice | None:
+        """Return the slice inside z corresponding to the given branch, if any."""
+        return self.state_slice_map.get(branch_name)
+
+    def state_names_for(self, branch_name: str) -> list[str]:
+        """Return the state names associated with a branch."""
+        return self.state_name_map.get(branch_name, [])
+
+    def _flatten_composites(self) -> None:
+        """
+        Expand every CompositeBranchComponent into its primitive subnetwork.
+
+        This allows users to register higher-level components that internally
+        consist of multiple branches, while keeping the solver unaware of the
+        hierarchy.
+        """
+        while True:
+            target: str | None = None
+            for branch_name in list(self.graph.branches.keys()):
+                comp = self.components.get(branch_name)
+                if isinstance(comp, CompositeBranchComponent):
+                    target = branch_name
+                    break
+            if target is None:
+                break
+            self._expand_composite_branch(target, self.components[target])
+
+    def _expand_composite_branch(self, branch_name: str, composite: CompositeBranchComponent) -> None:
+        n_from_name, n_to_name = self.graph.branches.pop(branch_name)
+        n_from = self.graph.nodes[n_from_name]
+        n_to = self.graph.nodes[n_to_name]
+        self.components.pop(branch_name, None)
+
+        node_map: dict[str, Node] = {
+            composite.POSITIVE_NODE: n_from,
+            composite.NEGATIVE_NODE: n_to,
+        }
+
+        for internal_name in composite._blueprint_nodes():
+            node_obj = Node(name=f"{branch_name}__{internal_name}")
+            self.graph.add_node(node_obj)
+            node_map[internal_name] = node_obj
+
+        for sub_name, (src, dst, sub_comp) in composite._blueprint_branches().items():
+            new_branch = f"{branch_name}__{sub_name}"
+            self.graph.add_branch(new_branch, node_map[src], node_map[dst])
+            self.components[new_branch] = sub_comp
 
     def assemble(self, v_next: Array, v_prev: Array, z_next: Array, z_prev: Array, t_next: float
                  ) -> tuple[Array, Array]:
