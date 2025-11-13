@@ -1,211 +1,146 @@
 # Electrical Simulation Engine
 
-Motore per la simulazione di reti elettriche. Il progetto ora espone due sottosistemi:
-- `simcore.dynamic`: simulatore nel dominio del tempo (non lineare, stato dipendente) basato su Newton-Raphson implicito.
-- `simcore.static`: risolutore DC/AC in regime stazionario (fasori complessi) per circuiti lineari e generatori pilotati.
+This repository hosts two circuit simulators that share a common spirit but work on different time scales:
+
+1. `simcore.dynamic` – a time-domain engine for nonlinear transient analysis driven by Newton–Raphson iterations.
+2. `simcore.static` – a steady-state solver for DC and single-frequency AC circuits built on Modified Nodal Analysis (MNA).
+
+Both subsystems ship with reusable components, ready-to-run examples, and helper utilities so you can start analysing circuits quickly and then dive into the source when you need to extend it.
 
 ---
 
-## Come si usa
+## Installation
 
-- **Installazione rapida**
-  ```bash
-  python3 -m venv .venv
-  source .venv/bin/activate
-  pip install -r requirements.txt
-  ```
-- **Eseguire un esempio dinamico**  
-  ```bash
-  python3 simcore/dynamic/examples/batt_sc_cpl.py            # battery + supercap + CPL
-  python3 simcore/dynamic/examples/motor_dc_states.py        # DC motor with direct state traces
-  python3 simcore/dynamic/examples/series_rc_step.py         # Series RC composite branch
-  python3 simcore/dynamic/examples/thermal_resistor_heating.py # Self-heating resistor with thermal RC
-  ```
-  Produce la risposta nel tempo di una batteria con resistenza serie, un condensatore e un carico a potenza costante.
-- **Eseguire un esempio statico**  
-  ```bash
-  python3 simcore/static/examples/voltage_divider.py
-  ```
-  Calcola il partitore R-C alimentato a 50 Hz e stampa tensioni, correnti (modulo/fase) e potenze.
-- **Notebook interattivo**  
-  Apri `simcore/dynamic/examples/notebook.ipynb` con Jupyter per esplorare la modellazione in maniera guidata.
-- **Simulazione dinamica personalizzata**
-  1. Definisci nodi e rami con `simcore.dynamic.network.NetworkGraph`.
-  2. Assegna componenti (`simcore.dynamic.components.*`).
-  3. Inizializza `simcore.dynamic.network.Network(graph, components, dt=...)`.
-  4. Esegui `simcore.dynamic.solver.integrate.run_sim(...)`.
-- **Analisi statica DC/AC**
-  1. Crea un `simcore.static.StaticCircuit(frequency=...)` (usa `None` per DC).
-  2. Instanzia componenti da `simcore.static.components` (resistenze, reattanze, sorgenti indipendenti/pilotate).
-  3. Aggiungi ciascun elemento con `circuit.add_element(component)`.
-  4. Chiama `solution = circuit.solve()` e interroga `solution.branch_current(...)`, `solution.branch_power(...)`, ecc.
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+All examples assume you run them from the project root with the virtual environment activated.
 
 ---
 
-## Panoramica dell'architettura
+## Quick Start
 
-### Motore dinamico (`simcore.dynamic`)
-- `simcore/dynamic/network/graph.py`  
-  Gestisce nodi (`Node`) e rami direzionati, fornendo la matrice di incidenza \( A \).
-- `simcore/dynamic/network/network.py`  
-  Monta il sistema KCL + equazioni di stato, costruisce residuo \( F \) e Jacobiana \( J \).
-- `simcore/dynamic/components/*`  
-  Contiene i modelli dei componenti (implementano `BranchComponent`).
-- `simcore/dynamic/solver/integrate.py`  
-  Integra nel tempo con schema implicito di Eulero e risoluzione Newton-Raphson.
-- `simcore/dynamic/solver/newton.py`  
-  Implementa il risolutore per sistemi non lineari con line-search opzionale.
+### Dynamic (time-domain) examples
 
-### Motore statico (`simcore.static`)
-- `simcore/static/circuit.py`  
-  Definisce il circuito MNA (analisi nodale modificata) e il solver per DC/AC.
-- `simcore/static/components/base.py`  
-  Interfacce comuni per i componenti in regime statico e helper per lo stamping.
-- `simcore/static/components/passive.py`  
-  Modelli di resistori, condensatori e induttori in DC/AC (fasori complessi).
-- `simcore/static/components/sources.py`  
-  Sorgenti indipendenti e pilotate (V/I, controllate in tensione o corrente).
-- `simcore/static/utils.py`  
-  Utility come il costruttore di fasori (`phasor`) e conversioni modulo/fase.
+```bash
+python3 simcore/dynamic/examples/batt_sc_cpl.py            # battery + supercap + CPL load
+python3 simcore/dynamic/examples/motor_dc_states.py        # DC motor, states + voltage traces
+python3 simcore/dynamic/examples/async_motor_speed_control.py # induction motor with slip & speed loop
+python3 simcore/dynamic/examples/series_rc_step.py         # composite RC macro
+python3 simcore/dynamic/examples/thermal_resistor_heating.py # self-heating resistor demo
+```
+
+Each script prints basic telemetry and (optionally) plots results with Matplotlib.
+
+### Static (phasor) examples
+
+```bash
+python3 simcore/static/examples/voltage_divider.py
+```
+
+This example solves a 50 Hz voltage divider and reports node voltages, branch currents (magnitude/phase), and active/reactive power.
 
 ---
 
-## Formulazione matematica
+## Using the Dynamic Engine
 
-### Equazioni di rete
+1. Describe the topology via `simcore.dynamic.network.NetworkGraph`, adding nodes (declare one ground) and branches.
+2. Build a `dict` of branch components. Available models live under `simcore.dynamic.components` (resistors, capacitors, inductors, diode, thermal resistor, batteries, composite elements, etc.). Custom models inherit from `BranchComponent`.
+3. Instantiate `simcore.dynamic.network.Network(graph, components, dt=...)`.
+4. Run a simulation with `simcore.dynamic.solver.integrate.run_sim(network, t_stop, v0_nodes)`.
+5. Inspect `SimResult` or call `component.state_history()` / `component.voltage_history()` on the original objects.
 
-Sia \( A \in \mathbb{R}^{n \times m} \) la matrice di incidenza nodo-ramo (nodi senza massa di riferimento, rami in ordine coerente con i componenti). Le tensioni di ramo sono \( v_b = A^{\top} v \) con \( v \) vettore delle tensioni dei nodi. Per ogni ramo \( j \) la corrente è data dal modello del componente: \( i_j = f_j(v_{b,j}, \dot{v}_{b,j}, z_j) \).
+Use the notebook at `simcore/dynamic/examples/notebook.ipynb` for a guided tour.
 
-Le correnti di nodo rispettano la KCL:
-\[
-F_{\text{nodes}}(v, z) = A\,i(v, \dot{v}, z) = 0.
-\]
+### Dynamic architecture overview
 
-### Discretizzazione implicita
+| Layer | Key files | Responsibilities |
+|-------|-----------|------------------|
+| Topology | `simcore/dynamic/network/graph.py` (`Node`, `NetworkGraph`) | Stores nodes/branches and builds the incidence matrix used for KCL. |
+| Component API | `simcore/dynamic/components/base.py` (`BranchComponent`, `EvalContext`) | Defines the contract every branch must satisfy (current, Jacobians, optional states) plus tooling for attaching time traces. |
+| Network assembler | `simcore/dynamic/network/network.py` (`Network`) | Expands composite bipoles, orders components, concatenates states, and builds residual/Jacobian blocks for Newton iterations. |
+| Solver | `simcore/dynamic/solver/integrate.py`, `simcore/dynamic/solver/newton.py` | Time stepping loop (implicit Euler) and the damped Newton core with optional line search. |
+| Examples & control | `simcore/dynamic/examples/*`, `simcore/dynamic/control/*` | Reference setups and external control hooks. |
 
-Si utilizza Eulero implicito con passo \( \Delta t = \mathrm{dt} \):
-\[
-\dot{v}_{b} \approx \frac{A^{\top}(v_{k+1} - v_k)}{\Delta t}.
-\]
-L'insieme di equazioni al passo \( k+1 \) è risolto simultaneamente per \( (v_{k+1}, z_{k+1}) \).
+#### How the dynamic solver works
 
-### Equazioni di stato
+1. **Topology preprocessing** – `Network.__post_init__` flattens composites, creates the incidence matrix `A`, orders branch names, and concatenates component states into a global `z` vector. Each stateful branch registers a slice and friendly state names.
+2. **State handling** – `Network._split_z` and the stored slices let the assembler feed individual state arrays back into each component. After every simulation run, `SimResult.attach_component_traces` pushes per-component time histories (states and branch voltages) into the original objects so users can request `component.state_history("SOC")`, etc.
+3. **Per-step assembly** – `Network.assemble` evaluates every component with an `EvalContext` containing branch voltage, implicit dv/dt, time, and dt. It builds:
+   - `F_nodes = A @ i_branch` (KCL residual).
+   - `F_states` by concatenating each component’s state residuals.
+   - Jacobian blocks (`J_vv`, `J_vz`, `J_zv`, `J_zz`) using component derivatives (`dI/dV`, `dI/dz`, `dR/dV`, `dR/dz`).
+4. **Newton iterations** – `run_sim` advances time with implicit Euler. For each step it concatenates `[v_next, z_next]`, calls `newton_solve`, and stores the converged solution. The Newton core (`simcore/dynamic/solver/newton.py`) supports damping, line search, and tolerances configured via `NewtonConfig`.
+5. **Result handling** – `SimResult` keeps node voltages (`v_nodes`), state histories (`z_hist`), branch voltages (`v_branches`), and metadata. Helper methods expose per-branch currents in polar form, power calculations, and state access by name. Components also gain direct access to their own voltage trace.
 
-Ogni componente con stato interno fornisce un residuo \( R_j(z_{k+1}, z_k, v_{b,k+1}) = 0 \). Il vettore globale è \( F_{\text{states}} = [R_1; R_2; \dots] \). Il sistema non lineare completo è
-\[
-F(x) =
-\begin{bmatrix}
-F_{\text{nodes}}(v_{k+1}, z_{k+1}) \\[4pt]
-F_{\text{states}}(v_{k+1}, z_{k+1})
-\end{bmatrix}
-= 0,
-\quad x = \begin{bmatrix} v_{k+1} \\ z_{k+1} \end{bmatrix}.
-\]
+Key classes to review:
+- `BranchComponent` (`simcore/dynamic/components/base.py`) – implement `current`, `dI_dv`, optional state logic.
+- `Network` (`simcore/dynamic/network/network.py`) – orchestrates ordering, slicing, and residual assembly.
+- `SimResult` (`simcore/dynamic/solver/integrate.py`) – attaches traces and exposes post-processing utilities.
 
-### Solver Newton-Raphson
+#### Featured dynamic components
 
-Il file `simcore/dynamic/solver/newton.py` implementa:
-\[
-J(x^{(r)}) \, \Delta x = -F(x^{(r)}),
-\qquad x^{(r+1)} = x^{(r)} + \alpha \Delta x,
-\]
-con fattori di regolarizzazione diagonali e ricerca in linea di tipo Armijo per la stabilità globale (`NewtonConfig` consente di regolare tolleranze, iterazioni e damping).
-
----
-
-## Componenti e relativi modelli matematici
-
-### Resistor (`simcore/dynamic/components/resistor.py`)
-
-- Legge di Ohm: \( i = \frac{v}{R} \).
-- Jacobiana: \( \frac{\partial i}{\partial v} = \frac{1}{R} \).
-- Componente puramente statico (nessuno stato interno).
-
-### Thermal Resistor (`simcore/dynamic/components/resistor_thermal.py`)
-
-- Resistenza dipendente dalla temperatura: \( R(T) = R_0 \left[1 + \alpha (T - T_\text{ref})\right] \).
-- Corrente: \( i = \frac{v}{R(T)} \) con derivata \( \partial i / \partial v = 1/R(T) \) e \( \partial i / \partial T = -v\,\alpha R_0 / R(T)^2 \).
-- Stato termico: \( C_\text{th} \, \frac{dT}{dt} = \frac{v^2}{R(T)} - \frac{T - T_\text{amb}}{R_\text{th}} \).
-- Il residuo viene integrato implicitamente e lo stato è osservabile via `component.state_history("T")`; la resistenza elettrica si aggiorna automaticamente passo dopo passo.
-
-### Capacitor (`simcore/dynamic/components/capacitor.py`)
-
-- Relazione continuo-temporale: \( i = C \frac{dv}{dt} \).
-- Discretizzazione implicita:
-  \[
-  i_{k+1} = C \frac{v_{k+1} - v_k}{\Delta t}, \qquad
-  \frac{\partial i}{\partial v_{k+1}} = \frac{C}{\Delta t}.
-  \]
-- Condizioni iniziali: in `Network._apply_capacitor_initial_conditions` ogni condensatore può specificare `V_init`. Se omesso, la tensione iniziale deriva dal valore già presente sul nodo (ad es. da `v0_nodes`). Il metodo impone la differenza di potenziale tra i nodi del ramo rispettando i nodi di riferimento.
-
-### Constant Power Load (`simcore/dynamic/components/constant_power_load.py`)
-
-- Obiettivo: mantenere \( P(t) = V \cdot I \).
-- Corrente: \( i = \frac{P(t)}{\max(v, v_{\min})} \).
-- Jacobiana (quando \( v > v_{\min} \)):
-  \[
-  \frac{\partial i}{\partial v} = -\frac{P(t)}{v^2}.
-  \]
-- Il limite \( v_{\min} \) evita denominatori nulli; sotto soglia la derivata viene posta a zero, pulendo la Jacobiana per tensioni molto basse.
-
-### Lithium Battery LUT (`simcore/dynamic/components/battery_lut.py`)
-
-Modello di Thevenin:
-
-- Corrente di ramo:
-  \[
-  i = \frac{v - \text{OCV}(\text{SOC})}{R_\text{internal}}.
-  \]
-- OCV ricavata da una tabella LUT (`soc_pts`, `ocv_pts`) tramite interpolazione lineare clampata a \([0,1]\).
-- Equazione di stato (bilancio di carica):
-  \[
-  \text{SOC}_{k+1} - \text{SOC}_{k} - \frac{\Delta t}{Q_\text{coulomb}} i_{k+1} = 0.
-  \]
-- Jacobiane:
-  \[
-  \frac{\partial i}{\partial v} = \frac{1}{R_\text{internal}},\qquad
-  \frac{\partial i}{\partial \text{SOC}} = -\frac{1}{R_\text{internal}}\frac{d\,\text{OCV}}{d\,\text{SOC}},
-  \]
-  \[
-  \frac{\partial R}{\partial z} = 1 - \frac{\Delta t}{Q_\text{coulomb}} \frac{\partial i}{\partial \text{SOC}},
-  \qquad
-  \frac{\partial R}{\partial v} = -\frac{\Delta t}{Q_\text{coulomb}} \frac{\partial i}{\partial v}.
-  \]
-
-Il termine \( Q_\text{coulomb} = Q_\text{Ah} \cdot 3600 \) viene calcolato in `__post_init__`.
+- `simcore.dynamic.components.synchronous_machine.SynchronousMachineFOC`  
+  Five-state PMSM model (i_d, i_q, mechanical speed, electrical angle, temperature) with copper/iron losses, load-torque hooks, and helper `dq_trace()` to recover a-b-c currents.
+- `simcore.dynamic.components.asynchronous_machine.AsynchronousMachineFOC`  
+  Seven-state induction machine (stator currents, rotor fluxes, speed, thermal node) including slip dynamics and dq/abc trace utilities for diagnostics.
+- Legacy components such as `Resistor`, `Capacitor`, `Inductor`, `ThermalResistor`, `LithiumBatteryLUT`, and composite macros (`SeriesRC`) remain available under `simcore.dynamic.components`.
 
 ---
 
-## Pipeline di simulazione
+## Using the Static Engine
 
-1. **Configurazione topologica**  
-   `NetworkGraph` costruisce \( A \) e gli ordinamenti di nodi/rami.
-2. **Creazione `Network`**  
-   - Mappa componenti nell'ordine dei rami.  
-   - Accoda gli stati iniziali nei vettori `z0`.  
-   - Prepara slicing per estrarre gli stati component-wise.  
-   - (Se necessario) calcola `V_init` dei condensatori.
-3. **Time stepping (`run_sim`)**  
-   - Per ciascun passo:  
-     a. Usa la soluzione precedente come guess.  
-     b. Costruisce residui e Jacobiane tramite `Network.assemble`.  
-     c. Chiede a Newton di trovare \( x = [v_{k+1}; z_{k+1}] \).  
-     d. Memorizza la storia delle tensioni e degli stati.
+1. Create a circuit: `circuit = simcore.static.StaticCircuit(frequency=50.0)` (set `None` for DC).
+2. Add elements from `simcore.static.components`, e.g.:
+   ```python
+   from simcore.static.components.passive import Resistor
+   from simcore.static.components.sources import VoltageSource
+   circuit.add_element(VoltageSource("Vs", "vin", "gnd", phasor(230, 0)))
+   circuit.add_element(Resistor("R1", "vin", "vout", resistance=10))
+   ```
+3. Solve once: `solution = circuit.solve()`.
+4. Query results: `solution.node_voltage("vout")`, `solution.branch_current_polar("R1")`, `solution.branch_power("Rload")`, etc.
 
-Risultato finale: `SimResult` con vettori `t`, `v_nodes` (matrice \( n_\text{nodi} \times (N+1) \)) e `z_hist` (stati concatenati).
+### Static architecture overview
+
+| Layer | Key files | Responsibilities |
+|-------|-----------|------------------|
+| Circuit core | `simcore/static/circuit.py` (`StaticCircuit`, `StaticSolution`) | Manages nodes, allocates auxiliary variables (for voltage sources & controlled elements), builds MNA matrices, and exposes solved voltages/currents/powers. |
+| Component API | `simcore/static/components/base.py` (`StaticElement`, `StampData`) | Provides stamping helpers for series admittances, current sources, voltage sources, and gives each element access to node indices and frequency. |
+| Passive models | `simcore/static/components/passive.py` | Resistor, capacitor, inductor models translate into admittances (`1/R`, `jωC`, `1/(jωL)` with sensible DC fallbacks). |
+| Sources | `simcore/static/components/sources.py` | Independent sources plus voltage/current-controlled versions. Controlled sources stamp entries referencing other nodes or auxiliary unknowns. |
+| Utilities | `simcore/static/utils.py` | Helpers for building phasors (`phasor(magnitude, phase_deg)`) and reporting polar values (`polar(complex_value)`). |
+| Examples | `simcore/static/examples/*` | Ready-made circuits demonstrating the API. |
+
+#### How the static solver works
+
+1. **Node bookkeeping** – `StaticCircuit` keeps a ground node plus every node encountered while adding elements. Non-ground nodes receive row/column indices for the admittance matrix `Y`.
+2. **Auxiliary variables** – Elements such as voltage sources or controlled sources request `num_aux_vars()`. During `solve()` the circuit assigns contiguous indices after the node rows. Each element can retrieve its auxiliary slice via `StampData.aux(...)`.
+3. **Stamping** – Each element implements `stamp(self, data: StampData)`:
+   - Resistors/capacitors/inductors call `stamp_series_admittance` with their complex admittance (capacitors/inductors derive `jωC` / `1/(jωL)` using `StampData.omega`).
+   - Current sources inject into the RHS vector `b`.
+   - Voltage sources and controlled sources modify both `Y` and `b`, referencing node indices and auxiliary rows.
+4. **Solving** – Once all elements stamp their contribution, `StaticCircuit.solve()` runs a single `np.linalg.solve(Y, b)`. The solution vector is split back into node voltages and auxiliary values per element.
+5. **Post-processing** – `StaticSolution` exposes helper methods:
+   - `node_voltage(name)` – returns the complex phasor.
+   - `branch_current(element_name)` and `branch_current_polar(...)`.
+   - `branch_power(element_name)` – computes `S = V * I*` and returns `(P, Q, |S|)`.
+   - `branch_voltage(element_name)` for convenience.
+
+Main objects to inspect:
+- `StaticElement` & `StampData` (`simcore/static/components/base.py`) – teach you how to add new components or controlled sources.
+- `StaticCircuit` (`simcore/static/circuit.py`) – shows the MNA assembly, auxiliary management, and solution storage.
+- `StaticSolution` (`simcore/static/circuit.py`) – demonstrates how to query results and derive polar quantities.
 
 ---
 
-## Estendere il motore
+## Extending the project
 
-- **Nuovi componenti**: eredita da `BranchComponent`, implementa `current`, `dI_dv`, opzionalmente stati (`n_states`, `state_init`, `state_residual`, `dRdz`, `dRdv`, `dI_dz`).
-- **Opzioni solver**: modifica `NewtonConfig` per cambiare tolleranza, iterazioni massime o disattivare il damping.
-- **Analisi avanzate**: usa i dati di `SimResult` per post-processing in NumPy/Pandas o per grafici (`matplotlib`).
-- **Componenti compositi**: se vuoi riutilizzare macro a due morsetti (es. filtri RC), eredita da `CompositeBranchComponent`. Registra i nodi interni con `add_internal_node` e i rami primitivi con `add_branch`, usando `+` e `-` per i terminali esterni. `Network` espande automaticamente questi blocchi in rami elementari; l'utente finale li istanzia e li aggiunge al grafo come qualunque altro componente. Il file `simcore/dynamic/components/composites.py` contiene l'esempio `SeriesRC` (resistenza in serie a un condensatore).
-- **Accesso alle grandezze**: dopo una simulazione puoi interrogare direttamente i componenti (`comp.state_history("SOC")`, `comp.voltage_history()`) oppure usare `SimResult.component_state(...)` / `SimResult.branch_voltage(...)` per recuperare le time-series senza passare dagli oggetti originali.
+- **Add new dynamic components** by inheriting from `BranchComponent`, declaring the number of states, and overriding the residual/Jacobian helpers. If the component is a macro made of simpler parts, derive from `CompositeBranchComponent`.
+- **Add new static components** by inheriting from `StaticElement`, overriding `num_aux_vars()` if necessary, and implementing the `stamp`/`branch_current` methods using the helpers in `StampData`.
+- **Combine both worlds** by building a static circuit to compute steady-state operating points or load flows and then feeding those values into a dynamic simulation as initial conditions.
 
----
-
-## Requisiti
-
-Le dipendenze principali sono in `requirements.txt` (NumPy, Matplotlib, Jupyter e pacchetti correlati). L'uso di un ambiente virtuale dedicato è raccomandato per mantenere coerenti i pacchetti.
+The codebase intentionally mirrors textbook formulations, so reading the modules referenced above should give engineers enough insight to trust and extend the solvers. If you plan to contribute new features, please keep the documentation structure in sync so future readers can continue using this README as a learning guide.

@@ -21,7 +21,7 @@ class Network:
         graph: NetworkGraph containing the circuit topology (nodes and branches).
         components: Dictionary mapping branch names to BranchComponent instances.
         dt: Time step for numerical integration.
-        A: Incidence matrix (computed automatically in __post_init__).
+        A: Incidence matrix (computed automatically in __post_init__). The incidence matrix is a matrix that relates the currents flowing through the branches to the voltages at the nodes, encoding the KCL equations.
         node_names: List of non-ground node names in matrix order.
         branch_names: List of branch names in matrix order.
         stateful_indices: List of branch indices that have internal states.
@@ -42,29 +42,6 @@ class Network:
     state_slice_map: Dict[str, slice] = field(init=False, repr=False)
     state_name_map: Dict[str, list[str]] = field(init=False, repr=False)
 
-    def _apply_capacitor_initial_conditions(self, v_nodes: np.ndarray):
-        """
-        If a capacitor declares V_init, apply that as initial voltage difference
-        across the branch at t=0 by adjusting the node potentials.
-        """
-        for branch_name, comp in self.components.items():
-            if hasattr(comp, "V_init") and comp.V_init is not None:
-                # branch index
-                bi = self.branch_names.index(branch_name)
-                # find its node endpoints
-                n_plus, n_minus = self.graph.branches[bi]  # (Node, Node)
-
-                Vc0 = comp.V_init
-
-                if n_minus.is_ground:
-                    v_nodes[n_plus.index] = Vc0
-                elif n_plus.is_ground:
-                    v_nodes[n_minus.index] = -Vc0
-                else:
-                    # nessun nodo è ground → imponiamo su n_plus e lasciamo all'utente chiudere il riferimento
-                    v_nodes[n_plus.index] = Vc0
-
-
     def __post_init__(self):
         """
         Initialize network structure after dataclass creation.
@@ -79,14 +56,17 @@ class Network:
         object.__setattr__(self, "node_names", node_names)
         object.__setattr__(self, "branch_names", branch_names)
 
-        # mappa componenti nell'ordine delle colonne
+        # comps_ordered is a list of components in the order of the branch names.
         comps_ordered = [self.components[name] for name in branch_names]
         # stati
         stateful_indices: List[int] = []
         z_init = []
         state_slice_map: Dict[str, slice] = {}
         state_name_map: Dict[str, list[str]] = {}
-        off = 0
+        off = 0 # offset is the index of the first state of the current component in the global state vector z.
+
+        # _slices is a list of slice objects to extract each component's state from z.
+        # For example, if the network has 3 components with 2 states each, _slices will be [slice(0, 2), slice(2, 4), slice(4, 6)].
         _slices: List[slice] = []
         for i, c in enumerate(comps_ordered):
             if c.n_states() > 0:
@@ -105,12 +85,12 @@ class Network:
                     names = [f"{branch_names[i]}[{k}]" for k in range(c.n_states())]
                 state_name_map[branch_names[i]] = names
                 off += c.n_states()
-        object.__setattr__(self, "stateful_indices", stateful_indices)
+        object.__setattr__(self, "stateful_indices", stateful_indices) # stateful_indices is a list of the indices of the stateful components in the global state vector z.
         object.__setattr__(self, "z0", np.concatenate(z_init) if z_init else np.empty(0))
 
-        object.__setattr__(self, "_slices", _slices)
-        object.__setattr__(self, "state_slice_map", state_slice_map)
-        object.__setattr__(self, "state_name_map", state_name_map)
+        object.__setattr__(self, "_slices", _slices) # _slices is a list of slice objects to extract each component's state from z.
+        object.__setattr__(self, "state_slice_map", state_slice_map) # state_slice_map is a dictionary mapping each branch name to the slice object to extract its states from z.
+        object.__setattr__(self, "state_name_map", state_name_map) # state_name_map is a dictionary mapping each branch name to the list of state names.
 
     # helper
     def _split_z(self, z: Array) -> List[Array]:
@@ -156,6 +136,25 @@ class Network:
             self._expand_composite_branch(target, self.components[target])
 
     def _expand_composite_branch(self, branch_name: str, composite: CompositeBranchComponent) -> None:
+        """
+        Expand a composite branch component into its primitive subnetwork.
+        
+        This method replaces a single composite branch with multiple primitive branches
+        and internal nodes. The composite's external nodes (positive and negative terminals)
+        are mapped to the original branch endpoints, while internal nodes are created with
+        prefixed names to avoid conflicts.
+        
+        The expansion process:
+        1. Removes the composite branch from the graph and components dictionary
+        2. Maps the composite's external nodes (POSITIVE_NODE, NEGATIVE_NODE) to the
+           original branch endpoints
+        3. Creates new internal nodes for each blueprint node, prefixed with the branch name
+        4. Adds new branches for each sub-component in the composite's blueprint
+        
+        Args:
+            branch_name: Name of the composite branch to expand (will be removed).
+            composite: The CompositeBranchComponent instance to expand.
+        """
         n_from_name, n_to_name = self.graph.branches.pop(branch_name)
         n_from = self.graph.nodes[n_from_name]
         n_to = self.graph.nodes[n_to_name]
