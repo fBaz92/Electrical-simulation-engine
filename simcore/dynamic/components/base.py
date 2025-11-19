@@ -68,6 +68,8 @@ class BranchComponent(ABC):
         - State management methods (n_states, state_names, state_init)
         - State evolution methods (state_residual, dRdz, dRdv, dI_dz)
     """
+    # Power tracking (updated by Network.assemble)
+    p_last: float = 0.0
 
     # ---- I-V nonlineare (richiesta dal solver) ----
     @abstractmethod

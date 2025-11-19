@@ -41,6 +41,10 @@ class Network:
     _slices: List[slice] = field(init=False)
     state_slice_map: Dict[str, slice] = field(init=False, repr=False)
     state_name_map: Dict[str, list[str]] = field(init=False, repr=False)
+    
+    # Auxiliary components (stateful composites that don't participate in KCL directly)
+    auxiliary_components: List[Tuple[BranchComponent, Tuple[str, str]]] = field(init=False, default_factory=list)
+    aux_node_indices: List[Tuple[int, int]] = field(init=False, default_factory=list)
 
     def __post_init__(self):
         """
@@ -50,6 +54,7 @@ class Network:
         the initial state vector. Also creates slice objects to efficiently extract
         individual component states from the concatenated state vector.
         """
+        self.auxiliary_components = []
         self._flatten_composites()
         A, node_names, branch_names = self.graph.incidence_matrix()
         object.__setattr__(self, "A", A)
@@ -85,6 +90,30 @@ class Network:
                     names = [f"{branch_names[i]}[{k}]" for k in range(c.n_states())]
                 state_name_map[branch_names[i]] = names
                 off += c.n_states()
+        
+        # Process auxiliary components states
+        # auxiliary_components is list of (component, (node_from, node_to))
+        aux_node_indices = []
+        node_name_to_idx = {name: i for i, name in enumerate(node_names)}
+        
+        for comp, (n_from, n_to) in self.auxiliary_components:
+            # Map nodes to indices (-1 for ground/not in node_names)
+            idx_from = node_name_to_idx.get(n_from, -1)
+            idx_to = node_name_to_idx.get(n_to, -1)
+            aux_node_indices.append((idx_from, idx_to))
+            
+            if comp.n_states() > 0:
+                z_init.append(comp.state_init())
+                sl = slice(off, off + comp.n_states())
+                _slices.append(sl)
+                # We don't add to state_slice_map/state_name_map for now as they use branch names
+                # and composites are removed from branch_names. 
+                # But we can store them if we want to access them later.
+                # Let's use the composite's original name if possible? 
+                # The composite doesn't store its name. We might need to change _expand to store name.
+                off += comp.n_states()
+
+        object.__setattr__(self, "aux_node_indices", aux_node_indices)
         object.__setattr__(self, "stateful_indices", stateful_indices) # stateful_indices is a list of the indices of the stateful components in the global state vector z.
         object.__setattr__(self, "z0", np.concatenate(z_init) if z_init else np.empty(0))
 
@@ -160,6 +189,15 @@ class Network:
         n_to = self.graph.nodes[n_to_name]
         self.components.pop(branch_name, None)
 
+        # If composite is stateful, keep it as auxiliary
+        if composite.n_states() > 0:
+            self.auxiliary_components.append((composite, (n_from_name, n_to_name)))
+            # We also need to track its name for state mapping if we want to debug
+            # For now, we just store it.
+            # To support state_slice_map, we would need to keep the name.
+            # Let's hack it: add to state_slice_map in __post_init__ using a separate list of names if we had them.
+            # For now, just keeping the object is enough for the solver.
+
         node_map: dict[str, Node] = {
             composite.POSITIVE_NODE: n_from,
             composite.NEGATIVE_NODE: n_to,
@@ -210,8 +248,8 @@ class Network:
         i_branch = np.zeros(len(comps))
         dI_dvbranch = np.zeros(len(comps))
 
-        z_split = self._split_z(z_next) if self.stateful_indices else []
-        z_prev_split = self._split_z(z_prev) if self.stateful_indices else []
+        z_split = self._split_z(z_next) if self._slices else []
+        z_prev_split = self._split_z(z_prev) if self._slices else []
 
         dI_dz_cols: list[Array] = []
 
@@ -229,16 +267,22 @@ class Network:
             else:
                 i_branch[bi] = comp.current(ctx, None)
                 dI_dvbranch[bi] = comp.dI_dv(ctx, None)
+            
+            # Update power tracking for auxiliary components to use
+            comp.p_last = i_branch[bi] * ctx.v_branch
 
         # KCL: F_nodes = A i = 0
         F_nodes = A @ i_branch
         J_vv = A @ np.diag(dI_dvbranch) @ A.T
 
         # Stati
+        R_states = []
+        J_zv_rows = []
+        J_zz_blocks = []
+        J_vz_cols = []
+        
+        # --- Regular Components ---
         if self.stateful_indices:
-            R_states = []
-            J_zv_rows = []
-            J_zz_blocks = []
             s_idx = 0
             for bi, comp in enumerate(comps):
                 if comp.n_states() > 0:
@@ -259,12 +303,8 @@ class Network:
                     # (n_states,1) @ (1,n_nodes) → (n_states, n_nodes)
                     J_zv_rows.append(dv_col @ a_col)
                     s_idx += 1
-            F_st = np.concatenate(R_states) if R_states else np.empty(0)
-            J_zv = np.vstack(J_zv_rows) if J_zv_rows else np.zeros((0, A.shape[0]))
-            # dF_nodes/dz
             
             # --- costruzione J_vz (dF_nodes/dz) generica per più stati per componente ---
-            J_vz_cols = []
             s_cursor = 0
             for bi, comp in enumerate(comps):
                 if comp.n_states() > 0:
@@ -282,16 +322,65 @@ class Network:
                         vec[bi] = d
                         J_vz_cols.append((A @ vec).reshape(-1,1))
                     s_cursor += 1
-            # se nessun componente ha stati, J_vz è (n_nodes x 0)
-            J_vz = np.hstack(J_vz_cols) if J_vz_cols else np.zeros((A.shape[0], 0))
+        
+        J_vz = np.hstack(J_vz_cols) if J_vz_cols else np.zeros((A.shape[0], 0))
 
+        # --- Auxiliary Components (Stateful Composites) ---
+        if self.auxiliary_components:
+            # s_idx continues from regular components (or 0 if none)
+            s_idx = len(self.stateful_indices)
             
-            J_zz = np.block([[blk for blk in J_zz_blocks]]) if J_zz_blocks else np.zeros((0,0))
-        else:
-            F_st = np.empty(0)
-            J_vz = np.zeros((A.shape[0], 0))
-            J_zv = np.zeros((0, A.shape[0]))
-            J_zz = np.zeros((0,0))
+            for i, (comp, _) in enumerate(self.auxiliary_components):
+                if comp.n_states() > 0:
+                    idx_from, idx_to = self.aux_node_indices[i]
+                    
+                    # Calculate v_branch and dvdt_branch manually
+                    v_f = v_next[idx_from] if idx_from >= 0 else 0.0
+                    v_t = v_next[idx_to] if idx_to >= 0 else 0.0
+                    v_b = v_f - v_t
+                    
+                    v_f_prev = v_prev[idx_from] if idx_from >= 0 else 0.0
+                    v_t_prev = v_prev[idx_to] if idx_to >= 0 else 0.0
+                    v_b_prev = v_f_prev - v_t_prev
+                    
+                    dvdt_b = (v_b - v_b_prev) / dt
+                    
+                    ctx = EvalContext(v_branch=float(v_b), dvdt_branch=float(dvdt_b),
+                                      t_next=float(t_next), dt=float(dt))
+                    
+                    zc_next = z_split[s_idx]
+                    zc_prev = z_prev_split[s_idx]
+                    
+                    # Residual
+                    r = comp.state_residual(ctx, zc_next, zc_prev)
+                    R_states.append(r)
+                    
+                    # Jacobian blocks
+                    J_zz_blocks.append(comp.dRdz(ctx, zc_next))
+                    
+                    # J_zv (dR/dv)
+                    dv = comp.dRdv(ctx, zc_next) # (n_states,)
+                    dv_col = dv.reshape(-1, 1)   # (n_states, 1)
+                    
+                    # Map to nodes
+                    row = np.zeros((comp.n_states(), A.shape[0]))
+                    if idx_from >= 0:
+                        row[:, idx_from] += dv
+                    if idx_to >= 0:
+                        row[:, idx_to] -= dv
+                    J_zv_rows.append(row)
+                    
+                    # J_vz (dF_nodes/dz) - usually 0 for aux unless they couple back
+                    # Auxiliary components don't contribute to KCL directly, so dF_nodes/dz is 0 for their states
+                    # We need to append columns of zeros to J_vz to match the auxiliary states dimensions
+                    zeros_col = np.zeros((A.shape[0], comp.n_states()))
+                    J_vz = np.hstack([J_vz, zeros_col])
+                    
+                    s_idx += 1
+
+        F_st = np.concatenate(R_states) if R_states else np.empty(0)
+        J_zv = np.vstack(J_zv_rows) if J_zv_rows else np.zeros((0, A.shape[0]))
+        J_zz = np.block([[blk for blk in J_zz_blocks]]) if J_zz_blocks else np.zeros((0,0))
 
         F = np.concatenate([F_nodes, F_st])
         J = np.block([[J_vv, J_vz],

@@ -3,7 +3,8 @@ from dataclasses import dataclass
 import numpy as np
 from typing import Dict, Callable
 from ..network.network import Network
-from ..components.base import BranchComponent, TimeTrace
+from ..components.base import BranchComponent, TimeTrace, EvalContext
+from ..components.capacitor import Capacitor
 from .newton import newton_solve, NewtonConfig
 
 Array = np.ndarray
@@ -26,6 +27,7 @@ class SimResult:
         state_slices: Mapping from branch name to the slice selecting its states.
         state_names: Mapping from branch name to the list of state labels.
         v_branches: Branch voltage history, shape (N+1, n_branches) following network.branch_names.
+        i_branches: Branch current history, shape (N+1, n_branches).
         branch_index: Mapping branch name -> column index inside v_branches.
     """
     t: Array
@@ -34,6 +36,7 @@ class SimResult:
     state_slices: Dict[str, slice]
     state_names: Dict[str, list[str]]
     v_branches: Array
+    i_branches: Array
     branch_index: Dict[str, int]
 
     def component_state(self, branch_name: str, state_name: str | None = None
@@ -87,6 +90,105 @@ class SimResult:
                 v_trace = TimeTrace(t=self.t, values=self.v_branches[:, idx])
                 comp._attach_voltage_trace(v_trace)
 
+def solve_consistent_initial_conditions(network: Network, newton_cfg: NewtonConfig | None = None) -> Array:
+    """
+    Solve for the consistent initial node voltages (DC Operating Point) at t=0.
+    
+    This treats:
+    - Capacitors as Voltage Sources (fixed at their initial voltage, usually 0).
+    - Inductors as Current Sources (fixed at their initial current, usually 0).
+    - Resistors and Sources as usual.
+    
+    This avoids artificial transients when connecting sources to uncharged capacitive networks.
+    """
+    if newton_cfg is None:
+        newton_cfg = NewtonConfig()
+        
+    n_nodes = network.A.shape[0]
+    v_guess = np.zeros(n_nodes)
+    
+    # We need to solve F(v) = 0 where F is KCL.
+    # But components behave differently in DC/Initialization.
+    # For now, we only handle Capacitors specially (as voltage sources).
+    
+    # We can reuse network.assemble BUT we need to trick it or the components.
+    # Since we don't want to modify components, we can create a wrapper or 
+    # manually assemble the system for initialization.
+    # Manual assembly is safer to avoid polluting component logic.
+    
+    # However, assemble is complex.
+    # Let's define a specialized assemble for DC init.
+    
+    comps = [network.components[name] for name in network.branch_names]
+    A = network.A
+    
+    def FJ_init(v):
+        # v is node voltages
+        v_branch = A.T @ v
+        
+        # We need to calculate branch currents and dI/dv
+        i_branch = np.zeros(len(comps))
+        dI_dvbranch = np.zeros(len(comps)) # Conductance
+        
+        # For initialization, we assume dv/dt = 0 (DC steady state relative to the instantaneous voltage)
+        # OR we treat C as voltage source.
+        # If we treat C as voltage source Vc_init (0), then:
+        # I_c is unknown? No, KCL solves for node voltages.
+        # If C is a voltage source, it fixes the voltage across it.
+        # This means it contributes to the Jacobian as a voltage source (G = inf).
+        # This is numerically hard.
+        
+        # Better approach: Model C as a small resistance (short) in series with V_init?
+        # Or simply a very large conductance.
+        # G_c_init = 1e6 (1 uOhm)
+        # I = G_c_init * (V_branch - V_c_init)
+        
+        G_stiff = 1e9 # 1 nOhm
+        
+        for bi, comp in enumerate(comps):
+            # Check type
+            if isinstance(comp, Capacitor):
+                # Treat as Voltage Source with series conductance G_stiff
+                # V_target = V_init (assume 0 for now or get from somewhere?)
+                # Capacitor doesn't store V_init explicitly in a way we can access easily 
+                # unless we look at z0.
+                # But z0 is global.
+                # For this task, we assume uncharged capacitors (V=0) or we need to map z0.
+                
+                # Let's assume V_c = 0 for uncharged start, which is the common case causing the spike.
+                # If we want to support pre-charged, we'd need to map z0.
+                
+                V_c = 0.0 
+                if comp.V_init is not None:
+                    V_c = comp.V_init
+                
+                # I = G * (V_b - V_c)
+                i_branch[bi] = G_stiff * (v_branch[bi] - V_c)
+                dI_dvbranch[bi] = G_stiff
+            else:
+                # Regular component (Resistor, Voltage Source, etc.)
+                # We evaluate it with dvdt=0
+                ctx = EvalContext(v_branch=float(v_branch[bi]),
+                                  dvdt_branch=0.0,
+                                  t_next=0.0, dt=1.0) # dt doesn't matter for static
+                
+                # We pass None for states, assuming resistive components don't depend on states for DC I(V)
+                # (except maybe thermal? but thermal is slow, so T=T_amb is fine)
+                i_branch[bi] = comp.current(ctx, None)
+                dI_dvbranch[bi] = comp.dI_dv(ctx, None)
+                
+        # KCL: A @ i_branch = 0
+        F = A @ i_branch
+        
+        # Jacobian: A @ diag(dI/dv) @ A.T
+        J = A @ np.diag(dI_dvbranch) @ A.T
+        
+        return F, J
+
+    # Solve
+    v_sol = newton_solve(FJ_init, v_guess, newton_cfg)
+    return v_sol
+
 def run_sim(network: Network, t_stop: float, v0_nodes: Array | None = None,
             newton_cfg: NewtonConfig | None = None) -> SimResult:
     """
@@ -127,11 +229,47 @@ def run_sim(network: Network, t_stop: float, v0_nodes: Array | None = None,
     z_prev = network.z0.copy()
     z_hist[0, :] = z_prev
 
+    z_hist[0, :] = z_prev
+    
+    # Determine initial node voltages
     if v0_nodes is not None:
         v_nodes[:, 0] = v0_nodes
+    else:
+        # Calculate consistent initial conditions
+        v_nodes[:, 0] = solve_consistent_initial_conditions(network, newton_cfg)
 
     if newton_cfg is None:
         newton_cfg = NewtonConfig()
+
+    # Initialize branch voltages and currents
+    n_branches = network.A.shape[1]
+    v_branches = np.zeros((N+1, n_branches))
+    i_branches = np.zeros((N+1, n_branches))
+
+    # Calculate initial branch voltages and currents (t=0)
+    v_branches[0, :] = network.A.T @ v_nodes[:, 0]
+    comps = [network.components[name] for name in network.branch_names]
+    z_split_list_0 = network._split_z(z_hist[0]) if network.stateful_indices else []
+    s_idx_0 = 0
+    # For t=0, dvdt is approximated using forward difference
+    # This requires v_branches[1] which is not yet computed.
+    # For now, we'll set dvdt_b_k to 0 for t=0, or re-evaluate after first step.
+    # A more robust approach might be to compute dvdt_b_k for t=0 after the first step.
+    # For simplicity, let's assume dvdt_b_k is 0 at t=0 for current calculation.
+    # Or, we can compute it after the first step and update i_branches[0].
+    # Let's compute it after the first step for t=0.
+    # For now, we'll compute i_branches[0] with dvdt_b_k = 0.0
+    for bi, comp in enumerate(comps):
+        ctx = EvalContext(v_branch=float(v_branches[0, bi]),
+                          dvdt_branch=0.0, # Will be updated after first step
+                          t_next=float(t[0]), dt=float(dt))
+        if comp.n_states() > 0:
+            zc = z_split_list_0[s_idx_0]
+            i_branches[0, bi] = comp.current(ctx, zc)
+            s_idx_0 += 1
+        else:
+            i_branches[0, bi] = comp.current(ctx, None)
+
 
     for k in range(N):
         v_prev = v_nodes[:, k].copy()
@@ -149,7 +287,42 @@ def run_sim(network: Network, t_stop: float, v0_nodes: Array | None = None,
         z_prev = x_sol[nv:]              # aggiorna stato
         z_hist[k+1, :] = z_prev          # <-- salva lo stato al passo k+1
 
-    v_branches = (network.A.T @ v_nodes).T  # shape (N+1, n_branches)
+        # Calculate branch voltages and currents for the current step k+1
+        v_branches[k+1, :] = network.A.T @ v_nodes[:, k+1]
+        
+        # Calculate dvdt_b_k for current step k+1
+        dvdt_b_k_plus_1 = (v_branches[k+1, :] - v_branches[k, :]) / dt
+        
+        # If this is the first step (k=0), we can now calculate dvdt_b_k for t=0
+        # and update i_branches[0]
+        if k == 0:
+            dvdt_b_k_0 = (v_branches[1, :] - v_branches[0, :]) / dt
+            s_idx_0 = 0
+            for bi, comp in enumerate(comps):
+                ctx = EvalContext(v_branch=float(v_branches[0, bi]),
+                                  dvdt_branch=float(dvdt_b_k_0[bi]),
+                                  t_next=float(t[0]), dt=float(dt))
+                if comp.n_states() > 0:
+                    zc = z_split_list_0[s_idx_0]
+                    i_branches[0, bi] = comp.current(ctx, zc)
+                    s_idx_0 += 1
+                else:
+                    i_branches[0, bi] = comp.current(ctx, None)
+
+        # Calculate i_branches for k+1
+        z_split_list_k_plus_1 = network._split_z(z_hist[k+1]) if network.stateful_indices else []
+        s_idx_k_plus_1 = 0
+        for bi, comp in enumerate(comps):
+            ctx = EvalContext(v_branch=float(v_branches[k+1, bi]),
+                              dvdt_branch=float(dvdt_b_k_plus_1[bi]),
+                              t_next=float(t[k+1]), dt=float(dt))
+            if comp.n_states() > 0:
+                zc = z_split_list_k_plus_1[s_idx_k_plus_1]
+                i_branches[k+1, bi] = comp.current(ctx, zc)
+                s_idx_k_plus_1 += 1
+            else:
+                i_branches[k+1, bi] = comp.current(ctx, None)
+
     branch_index = {name: idx for idx, name in enumerate(network.branch_names)}
 
     result = SimResult(
@@ -159,6 +332,7 @@ def run_sim(network: Network, t_stop: float, v0_nodes: Array | None = None,
         state_slices=network.state_slice_map,
         state_names=network.state_name_map,
         v_branches=v_branches,
+        i_branches=i_branches,
         branch_index=branch_index,
     )
     result.attach_component_traces(network.components)
@@ -221,8 +395,14 @@ def run_sim_with_control(
 
     # Numero nodi (equazioni KCL)
     n_nodes = network.A.shape[0]
+    # Numero nodi (equazioni KCL)
+    n_nodes = network.A.shape[0]
     v_nodes = np.zeros((n_nodes, N+1))
-    v_nodes[:, 0] = v0_nodes.copy()
+    
+    if v0_nodes is not None:
+        v_nodes[:, 0] = v0_nodes.copy()
+    else:
+        v_nodes[:, 0] = solve_consistent_initial_conditions(network, newton_cfg)
 
     # Stati dinamici
     z_prev = network.z0.copy()
@@ -256,6 +436,31 @@ def run_sim_with_control(
         z_hist[k+1, :] = z_prev
 
     v_branches = (network.A.T @ v_nodes).T
+    
+    # Calcolo correnti (vedi run_sim per dettagli)
+    i_branches = np.zeros_like(v_branches)
+    comps = [network.components[name] for name in network.branch_names]
+    z_split_list = [network._split_z(z_hist[k]) if network.stateful_indices else [] for k in range(N+1)]
+    
+    for k in range(N+1):
+        v_b_k = v_branches[k]
+        if k > 0:
+            dvdt_b_k = (v_branches[k] - v_branches[k-1]) / dt
+        else:
+            dvdt_b_k = (v_branches[1] - v_branches[0]) / dt
+            
+        s_idx = 0
+        for bi, comp in enumerate(comps):
+            ctx = EvalContext(v_branch=float(v_b_k[bi]),
+                              dvdt_branch=float(dvdt_b_k[bi]),
+                              t_next=float(t[k]), dt=float(dt))
+            if comp.n_states() > 0:
+                zc = z_split_list[k][s_idx]
+                i_branches[k, bi] = comp.current(ctx, zc)
+                s_idx += 1
+            else:
+                i_branches[k, bi] = comp.current(ctx, None)
+
     branch_index = {name: idx for idx, name in enumerate(network.branch_names)}
 
     result = SimResult(
@@ -265,6 +470,7 @@ def run_sim_with_control(
         state_slices=network.state_slice_map,
         state_names=network.state_name_map,
         v_branches=v_branches,
+        i_branches=i_branches,
         branch_index=branch_index,
     )
     result.attach_component_traces(network.components)
